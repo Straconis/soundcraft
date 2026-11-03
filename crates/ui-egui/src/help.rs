@@ -3,7 +3,11 @@
 //!
 //! Pages are built from the command registry (label, menu, shortcut) plus a plain-words description
 //! per command id in `help/commands.json`. A test fails when a command has no description, so new
-//! commands can't ship undocumented.
+//! commands can't ship undocumented. How-to guides and key pages live in `help/guides.json`; their
+//! text names commands by id (`{menu:session.save}`, `{key:session.save}`), so menus and shortcuts
+//! shown in a guide always match the app.
+//!
+//! Cmd+? opens help on the page for the window under the pointer.
 
 use crate::SoundApp;
 use crate::theme::{Tokens, bold, mono, regular};
@@ -17,6 +21,7 @@ pub const REPORT_URL: &str = "https://github.com/storytold/soundcraft/issues";
 
 /// The descriptions, compiled in so help works offline and in the web build.
 const DATA: &str = include_str!("../help/commands.json");
+const GUIDES: &str = include_str!("../help/guides.json");
 
 /// Back/Forward remember at most this many pages.
 const HISTORY: usize = 100;
@@ -47,15 +52,42 @@ struct ProcessHelp {
     text: String,
 }
 
+/// A how-to guide or a page of keys.
+#[derive(Debug, Default, Deserialize)]
+struct Guide {
+    id: String,
+    title: String,
+    category: String,
+    summary: String,
+    /// Numbered steps, or notes when the guide is a table of keys.
+    #[serde(default)]
+    steps: Vec<String>,
+    /// Key and what it does, for key pages.
+    #[serde(default)]
+    keys: Vec<(String, String)>,
+    /// Command pages to read next.
+    #[serde(default)]
+    related: Vec<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct Data {
     categories: Vec<Category>,
     commands: BTreeMap<String, CommandHelp>,
     audiosuite: Vec<ProcessHelp>,
+    #[serde(skip)]
+    guides: Vec<Guide>,
+}
+
+#[derive(Deserialize)]
+struct GuideFile {
+    guides: Vec<Guide>,
 }
 
 fn parse() -> Result<Data, serde_json::Error> {
-    serde_json::from_str(DATA)
+    let mut d: Data = serde_json::from_str(DATA)?;
+    d.guides = serde_json::from_str::<GuideFile>(GUIDES)?.guides;
+    Ok(d)
 }
 
 /// Help never takes the app down: unreadable data (a test catches that) leaves help empty.
@@ -74,6 +106,8 @@ pub enum Page {
     Command(String),
     /// An AudioSuite process, by its SoundCraft process id.
     Process(String),
+    /// A how-to guide or key page, by its id in `guides.json`.
+    Guide(String),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +145,10 @@ pub struct HelpState {
     /// Help › Report a Problem… opens the browser on the next frame (it needs the egui context).
     #[serde(skip)]
     pub open_report: bool,
+    /// A text box had the keyboard at the end of last frame. egui drops focus as soon as Escape is
+    /// pressed, so this is how Escape that leaves a box is told from Escape that closes help.
+    #[serde(skip)]
+    typing: bool,
 }
 
 impl HelpState {
@@ -242,6 +280,24 @@ fn entries() -> &'static [Entry] {
             let hay = format!("{} {} {} audiosuite", p.title, p.text, paths.join(" ")).to_lowercase();
             v.push(Entry { page: Page::Process(p.process.clone()), title: p.title.clone(), name: p.title.clone(), paths, text: p.text.clone(), hay });
         }
+        for g in &d.guides {
+            // Search reads guides as shown on a Mac and on a PC, so both Cmd+S and Ctrl+S find them.
+            let mut hay = format!("{} {} guide how to", g.title, g.summary);
+            for mac in [true, false] {
+                for line in g.steps.iter().chain(g.keys.iter().flat_map(|(k, what)| [k, what])) {
+                    hay.push(' ');
+                    hay.extend(spans(line, mac).into_iter().map(|(t, _)| t));
+                }
+            }
+            v.push(Entry {
+                page: Page::Guide(g.id.clone()),
+                title: g.title.clone(),
+                name: g.title.clone(),
+                paths: Vec::new(),
+                text: g.summary.clone(),
+                hay: hay.to_lowercase(),
+            });
+        }
         v.sort_by_cached_key(|e| e.title.to_lowercase());
         let mut count: HashMap<String, usize> = HashMap::new();
         for e in &v {
@@ -262,6 +318,34 @@ fn entries() -> &'static [Entry] {
     })
 }
 
+/// Whether `query` is this command's shortcut, spelled as on a Mac or on a PC.
+fn is_shortcut_of(e: &Entry, query: &str) -> bool {
+    let Page::Command(id) = &e.page else { return false };
+    let Some(keys) = crate::menus::shortcut_for(id) else { return false };
+    let compact = query.replace(' ', "");
+    [keys.to_string(), crate::shortcuts::shortcut_label(keys, false)].iter().any(|k| k.to_lowercase().replace(' ', "") == compact)
+}
+
+/// `a` and `b` differ by at most one letter added, dropped, changed or swapped with its
+/// neighbour. Short words must match exactly, or "mix" would find "max".
+fn one_typo(a: &str, b: &str) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    if a == b {
+        return true;
+    }
+    if a.len().min(b.len()) < 4 || a.len().abs_diff(b.len()) > 1 {
+        return false;
+    }
+    let start = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let (ra, rb) = (&a[start..], &b[start..]);
+    let tail = |x: &[char], y: &[char]| x == y;
+    match ra.len().cmp(&rb.len()) {
+        std::cmp::Ordering::Equal => tail(&ra[1..], &rb[1..]) || (ra.len() >= 2 && ra[0] == rb[1] && ra[1] == rb[0] && tail(&ra[2..], &rb[2..])),
+        std::cmp::Ordering::Greater => tail(&ra[1..], rb),
+        std::cmp::Ordering::Less => tail(ra, &rb[1..]),
+    }
+}
+
 /// Search results, best first. Every word must appear somewhere on the page, or the title must
 /// match loosely (letters in order, so "bnc mix" finds Bounce Mix).
 fn search(query: &str) -> Vec<&'static Entry> {
@@ -274,14 +358,23 @@ fn search(query: &str) -> Vec<&'static Entry> {
         .iter()
         .filter_map(|e| {
             let title = e.title.to_lowercase();
-            let s = if let Some(at) = title.find(&q) {
+            let s = if is_shortcut_of(e, &q) {
+                // "cmd+s" or "ctrl+s": the command on that very key comes before ones that merely
+                // contain it (Cmd+Shift+S…).
+                4000
+            } else if let Some(at) = title.find(&q) {
                 3000 - i32::try_from(at).unwrap_or(999)
             } else if words.iter().all(|w| title.contains(w)) {
                 2500
             } else if words.iter().all(|w| e.hay.contains(w)) {
                 1000
+            } else if let Some(s) = crate::palette::score(&e.title, &q).filter(|s| *s > 450) {
+                s
+            } else if words.iter().all(|w| title.split_whitespace().any(|t| one_typo(w, t))) {
+                // A slip of one letter ("sholo" for Solo) still finds the page.
+                400
             } else {
-                crate::palette::score(&e.title, &q).filter(|s| *s > 450)?
+                return None;
             };
             Some((s, e))
         })
@@ -314,12 +407,60 @@ fn category_of(page: &Page) -> Option<&str> {
         Page::Category(c) => Some(c.as_str()),
         Page::Command(id) => data().commands.get(id).map(|h| h.category.as_str()),
         Page::Process(_) => Some("processing"),
+        Page::Guide(id) => guide(id).map(|g| g.category.as_str()),
     }
 }
 
-/// Pages under a category, in title order.
+fn guide(id: &str) -> Option<&'static Guide> {
+    data().guides.iter().find(|g| g.id == id)
+}
+
+fn is_guide(e: &Entry) -> bool {
+    matches!(e.page, Page::Guide(_))
+}
+
+/// Pages under a category: its guides first, then the rest, each in title order.
 fn pages_in(category: &str) -> impl Iterator<Item = &'static Entry> + '_ {
-    entries().iter().filter(move |e| category_of(&e.page) == Some(category))
+    let here = move |e: &&Entry| category_of(&e.page) == Some(category);
+    entries().iter().filter(here).filter(|e| is_guide(e)).chain(entries().iter().filter(here).filter(|e| !is_guide(e)))
+}
+
+/// A guide line cut into text and the parts that name something in the app: `{menu:id}` (the
+/// command's menu location), `{key:id}` (its shortcut) and `{keys:Cmd+S}` (a key chord). Shortcuts
+/// show the keys of the platform (`Ctrl` for `Cmd` off macOS). The bool marks a named part.
+fn spans(line: &str, mac: bool) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(open) = rest.find('{') {
+        let Some(close) = rest.get(open..).and_then(|r| r.find('}')).map(|c| c + open) else { break };
+        if open > 0 {
+            out.push((rest.get(..open).unwrap_or_default().to_string(), false));
+        }
+        let token = rest.get(open + 1..close).unwrap_or_default();
+        out.push((token_text(token, mac).unwrap_or_else(|| token.to_string()), true));
+        rest = rest.get(close + 1..).unwrap_or_default();
+    }
+    if !rest.is_empty() {
+        out.push((rest.to_string(), false));
+    }
+    out
+}
+
+/// What a `{kind:value}` token in a guide shows, or None when it names nothing (a test checks).
+fn token_text(token: &str, mac: bool) -> Option<String> {
+    let (kind, value) = token.split_once(':')?;
+    match kind {
+        "menu" => menu_paths().get(value).and_then(|p| p.first()).map(|p| pretty_path(p)),
+        "key" => crate::menus::shortcut_for(value).map(|k| key_text(k, mac)),
+        "keys" => Some(key_text(value, mac)),
+        _ => None,
+    }
+}
+
+/// A shortcut as the platform's keyboard spells it.
+fn key_text(keys: &str, mac: bool) -> String {
+    let label = crate::shortcuts::shortcut_label(keys, mac);
+    if label.is_empty() { format!("{keys} (Mac only)") } else { label }
 }
 
 /// The first sentence of a description, for lists ("e.g." and "i.e." don't end a sentence).
@@ -342,6 +483,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     }
     if !app.ui.show_help {
         app.ui.help.was_open = false;
+        app.ui.help.typing = false;
         return;
     }
     if !std::mem::replace(&mut app.ui.help.was_open, true) {
@@ -349,7 +491,10 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     }
     let mut open = true;
     // Never wider or taller than the app's window, so nothing on a page is cut off at its edge.
-    let screen = ctx.content_rect().size() - vec2(32.0, 48.0);
+    // Below the 24-point menu bar, so the title bar never covers it.
+    let mut free = ctx.content_rect();
+    free.min.y += 24.0;
+    let screen = free.size() - vec2(32.0, 16.0);
     let min = vec2(560.0, 360.0).min(screen);
     let shown = egui::Window::new("SoundCraft Help")
         .open(&mut open)
@@ -357,6 +502,8 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
         .min_size(min)
         .max_size(screen.max(min))
         .collapsible(false)
+        .default_pos(free.min + vec2(16.0, 8.0))
+        .constrain_to(free)
         .show(ctx, |ui| window_body(app, ui));
     // Alt+Left / Alt+Right are Back and Forward while the pointer is over help.
     if shown.is_some_and(|r| r.response.contains_pointer()) {
@@ -367,17 +514,26 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
         if forward {
             app.ui.help.go_forward();
         }
+        // Escape closes help, unless it is clearing a search box that has the keyboard.
+        if !app.ui.help.typing && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            open = false;
+        }
     }
     app.ui.show_help = open;
+    app.ui.help.typing = ctx.egui_wants_keyboard_input();
 }
 
 fn window_body(app: &mut SoundApp, ui: &mut Ui) {
+    // The highlight is the accent blue in both themes: white text on it reads in light mode too.
+    ui.visuals_mut().selection.stroke.color = egui::Color32::WHITE;
     toolbar(app, ui);
     ui.separator();
     let height = ui.available_height();
     ui.horizontal_top(|ui| {
-        ui.allocate_ui_with_layout(vec2(NAV_WIDTH, height), Layout::top_down(Align::Min), |ui| {
-            ui.set_min_size(vec2(NAV_WIDTH, height));
+        // Exactly the same width on every tab: a long title is cut short rather than widening it.
+        let (rect, _) = ui.allocate_exact_size(vec2(NAV_WIDTH, height), egui::Sense::hover());
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Min)), |ui| {
+            ui.set_clip_rect(rect.intersect(ui.clip_rect()));
             navigation(app, ui);
         });
         ui.separator();
@@ -457,7 +613,7 @@ fn contents(app: &mut SoundApp, ui: &mut Ui) {
             }
             state
                 .show_header(ui, |ui| {
-                    let r = ui.selectable_label(h.page == Page::Category(c.id.clone()), &c.title);
+                    let r = ui.add(egui::Button::selectable(h.page == Page::Category(c.id.clone()), &c.title).truncate());
                     if r.clicked() {
                         go = Some(Page::Category(c.id.clone()));
                     }
@@ -467,7 +623,7 @@ fn contents(app: &mut SoundApp, ui: &mut Ui) {
                 })
                 .body(|ui| {
                     for e in pages_in(&c.id) {
-                        let r = ui.selectable_label(h.page == e.page, &e.name);
+                        let r = ui.selectable_label(h.page == e.page, list_title(e, h.page == e.page));
                         if r.clicked() {
                             go = Some(e.page.clone());
                         }
@@ -520,15 +676,18 @@ fn search_results(app: &mut SoundApp, ui: &mut Ui) {
     let hits = search(&h.query);
     let mut go = None;
     egui::ScrollArea::vertical().id_salt("help_search").auto_shrink([false, false]).show(ui, |ui| {
+        // Leave room for the scroll bar so descriptions wrap before it.
+        ui.set_max_width(ui.available_width() - 12.0);
         if h.query.trim().is_empty() {
-            ui.label(RichText::new("Type in the search box above: a word, a menu name or a shortcut such as Cmd+S.").color(t.text_dim));
+            let example = if cfg!(target_os = "macos") { "Cmd+S" } else { "Ctrl+S" };
+            ui.label(RichText::new(format!("Type in the search box above: a word, a menu name or a shortcut such as {example}.")).color(t.text_dim));
             return;
         }
         if hits.is_empty() {
             ui.label(RichText::new("No pages match. Try fewer or different words.").color(t.text_dim));
         }
         for e in hits {
-            let r = ui.selectable_label(h.page == e.page, RichText::new(&e.name).font(bold(12.5)));
+            let r = ui.selectable_label(h.page == e.page, list_title(e, h.page == e.page).font(bold(12.5)));
             ui.label(RichText::new(first_sentence(&e.text)).small().color(t.text_dim));
             ui.add_space(4.0);
             if r.clicked() {
@@ -569,6 +728,7 @@ fn page(app: &mut SoundApp, ui: &mut Ui) {
         Page::Category(id) => category_page(app, ui, &id),
         Page::Command(id) => command_page(app, ui, &id),
         Page::Process(id) => process_page(app, ui, &id),
+        Page::Guide(id) => guide_page(app, ui, &id),
     }
 }
 
@@ -589,9 +749,32 @@ fn welcome(app: &mut SoundApp, ui: &mut Ui) {
     ui.label("Every command in SoundCraft has a page here that says what it does, where it is in the menus and its shortcut.");
     ui.add_space(4.0);
     ui.label(RichText::new("Browse by topic in Contents, look a word up in Index, or type what you want to do in the search box.").color(t.text_dim));
+    ui.label(
+        RichText::new("Point at any SoundCraft window and press Cmd+? to open help on that window's page.".replace("Cmd+?", &help_key(ui)))
+            .color(t.text_dim),
+    );
     ui.add_space(12.0);
     let mut go = None;
     let col = column_width(ui);
+    ui.label(RichText::new("How to").font(bold(15.0)));
+    ui.add_space(4.0);
+    egui::Grid::new("help_guides").num_columns(2).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
+        for (i, g) in data().guides.iter().enumerate() {
+            ui.vertical(|ui| {
+                ui.set_width(col);
+                if ui.link(RichText::new(&g.title).font(bold(13.0))).clicked() {
+                    go = Some(Page::Guide(g.id.clone()));
+                }
+                ui.label(RichText::new(&g.summary).small().color(t.text_dim));
+            });
+            if i % 2 == 1 {
+                ui.end_row();
+            }
+        }
+    });
+    ui.add_space(14.0);
+    ui.label(RichText::new("Topics").font(bold(15.0)));
+    ui.add_space(4.0);
     egui::Grid::new("help_topics").num_columns(2).spacing(vec2(16.0, 10.0)).show(ui, |ui| {
         for (i, c) in data().categories.iter().enumerate() {
             ui.vertical(|ui| {
@@ -622,7 +805,7 @@ fn category_page(app: &mut SoundApp, ui: &mut Ui, id: &str) {
     ui.add_space(10.0);
     let mut go = None;
     for e in pages_in(id) {
-        if ui.link(RichText::new(&e.name).font(bold(12.5))).clicked() {
+        if ui.link(list_title(e, false).font(bold(12.5))).clicked() {
             go = Some(e.page.clone());
         }
         ui.label(first_sentence(&e.text));
@@ -716,6 +899,200 @@ fn command_page(app: &mut SoundApp, ui: &mut Ui, id: &str) {
     ui.label(RichText::new(format!("Command id: {id}")).font(mono(10.5)).color(t.text_dim));
 }
 
+/// A page's name in lists. Guides are in the accent colour so they stand out among the commands,
+/// except when selected, where the selection is already drawn in the accent colour.
+fn list_title(e: &Entry, selected: bool) -> RichText {
+    let text = RichText::new(&e.name);
+    if is_guide(e) && !selected { text.color(Tokens::current().accent) } else { text }
+}
+
+/// The help key as this platform spells it.
+fn help_key(ui: &Ui) -> String {
+    if ui.ctx().os().is_mac() { "Cmd+?".into() } else { "Ctrl+Shift+/".into() }
+}
+
+/// One guide line, with the menu locations and keys it names in bold.
+fn guide_line(ui: &mut Ui, line: &str, mac: bool) {
+    let t = Tokens::current();
+    let mut job = egui::text::LayoutJob::default();
+    for (text, named) in spans(line, mac) {
+        let font = if named { bold(14.0) } else { regular(14.0) };
+        job.append(&text, 0.0, egui::TextFormat { font_id: font, color: t.text, ..Default::default() });
+    }
+    job.wrap.max_width = ui.available_width();
+    ui.label(job);
+}
+
+/// A key column entry such as `Ctrl+Up / Ctrl+Down`, spelled for this platform.
+fn keys_cell(keys: &str, mac: bool) -> String {
+    // "Mac keys | PC keys" when the two differ by more than Cmd and Ctrl.
+    let keys = match keys.split_once(" | ") {
+        Some((on_mac, on_pc)) => {
+            if mac {
+                on_mac
+            } else {
+                on_pc
+            }
+        }
+        None => keys,
+    };
+    keys.split(" / ")
+        .map(|k| {
+            let label = crate::shortcuts::shortcut_label(k, mac);
+            if label.is_empty() { k.to_string() } else { label }
+        })
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+fn guide_page(app: &mut SoundApp, ui: &mut Ui, id: &str) {
+    let t = Tokens::current();
+    let Some(g) = guide(id) else {
+        title(ui, "Page not found");
+        return;
+    };
+    let mac = ui.ctx().os().is_mac();
+    breadcrumb(app, ui, &g.category);
+    title(ui, &g.title);
+    ui.label(RichText::new(&g.summary).color(t.text_dim));
+    ui.add_space(10.0);
+    // A page of keys reads its notes as plain paragraphs; a how-to numbers its steps.
+    let numbered = g.keys.is_empty();
+    for (n, step) in g.steps.iter().enumerate() {
+        ui.horizontal_top(|ui| {
+            if numbered {
+                ui.add_sized(vec2(22.0, 18.0), egui::Label::new(RichText::new(format!("{}.", n + 1)).font(bold(14.0)).color(t.accent)));
+            }
+            ui.vertical(|ui| guide_line(ui, step, mac));
+        });
+        ui.add_space(6.0);
+    }
+    if !g.keys.is_empty() {
+        ui.add_space(4.0);
+        // Keys in a column as wide as the widest key (at most 40% of the page), what they do beside
+        // them, wrapping within the page.
+        let font = mono(12.0);
+        let widest = g
+            .keys
+            .iter()
+            .flat_map(|(keys, _)| keys_cell(keys, mac).split(" / ").map(str::to_string).collect::<Vec<_>>())
+            .map(|key| ui.fonts_mut(|f| f.layout_no_wrap(key, font.clone(), t.text).size().x))
+            .fold(0.0, f32::max);
+        let key_width = (widest + 20.0).min(ui.available_width() * 0.4);
+        for (keys, what) in &g.keys {
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(vec2(key_width, 0.0), Layout::left_to_right(Align::Min).with_main_wrap(true), |ui| {
+                    ui.set_width(key_width);
+                    // Each key of a pair ("Ctrl+Up / Ctrl+Down") gets its own tag, so a pair can wrap.
+                    for key in keys_cell(keys, mac).split(" / ") {
+                        chip(ui, RichText::new(key).font(font.clone()));
+                    }
+                });
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.add_space(3.0);
+                    ui.label(what);
+                });
+            });
+            ui.add_space(4.0);
+        }
+    }
+    let related: Vec<&Entry> = g.related.iter().filter_map(|c| entry_for(&Page::Command(c.clone()))).collect();
+    if !related.is_empty() {
+        ui.add_space(14.0);
+        ui.label(RichText::new("Related commands").font(bold(13.0)));
+        ui.add_space(4.0);
+        let mut go = None;
+        ui.horizontal_wrapped(|ui| {
+            for e in related {
+                // A menu location names a command better than its label alone ("Track › New...", not "New").
+                let name = e.paths.first().unwrap_or(&e.title);
+                if ui.link(name).clicked() {
+                    go = Some(e.page.clone());
+                }
+                ui.add_space(8.0);
+            }
+        });
+        if let Some(p) = go {
+            app.ui.help.go(p);
+        }
+    }
+}
+
+/// Floating windows and the help page each opens on, for Cmd+? over the window. The titles are the
+/// ones the windows are created with (egui gives a window its id from its title).
+pub const WINDOW_PAGES: [(&str, &str); 31] = [
+    ("About SoundCraft", "window.about"),
+    ("Appearance", "window.ui_customization"),
+    ("Automation", "window.automation"),
+    ("Beat Detective", "window.beat_detective"),
+    ("Big Counter", "window.big_counter"),
+    ("Clip Effects", "window.clip_effects"),
+    ("Color Palette", "window.color_palette"),
+    ("Disk Usage", "window.disk_usage"),
+    ("I/O Setup", "window.io_setup"),
+    ("Keyboard Shortcuts", "window.shortcuts"),
+    ("MIDI Event List", "window.event_list"),
+    ("MIDI Keyboard", "window.midi_keyboard"),
+    ("MIDI Operations", "window.midi_ops"),
+    ("MIDI Real-Time Properties", "window.rtp"),
+    ("Metadata Inspector", "window.metadata"),
+    ("Playback Engine", "window.playback_engine"),
+    ("Renderer", "window.renderer"),
+    ("Score Editor", "window.score"),
+    ("Search", "window.search"),
+    ("Session Audio Health", "window.audio_health"),
+    ("Session Info", "window.session_info"),
+    ("System Usage", "window.system_usage"),
+    ("Task Manager", "window.task_manager"),
+    ("Tempo Operations", "window.tempo_ops"),
+    ("Time Operations", "window.time_ops"),
+    ("Transport", "window.transport"),
+    ("Video", "window.video"),
+    ("Video Universe", "window.video_universe"),
+    ("Window Configurations", "window.configurations"),
+    ("Workspace", "window.workspace"),
+    ("Check for Updates", "app.checkForUpdates"),
+];
+
+/// The id egui gives a window titled `title`: `Window::new` names its area after the title's text,
+/// which egui holds as an `Option`. A test opens every window in [`WINDOW_PAGES`] to check this.
+pub fn window_id(title: &str) -> egui::Id {
+    egui::Id::unique(Some(title))
+}
+
+/// The help page for what's under the pointer: a floating window's page, the open AudioSuite
+/// process, or the Edit or Mix window's page over the main area. None over help itself, a menu or
+/// a window help has no page for.
+fn page_under_pointer(app: &SoundApp, ctx: &egui::Context) -> Option<Page> {
+    let pos = ctx.input(|i| i.pointer.latest_pos())?;
+    let layer = ctx.layer_id_at(pos)?;
+    if let Some((_, id)) = WINDOW_PAGES.iter().find(|(title, _)| layer.id == window_id(title)) {
+        return Some(Page::Command((*id).to_string()));
+    }
+    if let Some(process) = &app.ui.audiosuite
+        && layer.order == egui::Order::Middle
+        && data().audiosuite.iter().any(|p| &p.process == process)
+        && layer.id == window_id(&crate::dialogs::audiosuite::window_title(process))
+    {
+        return Some(Page::Process(process.clone()));
+    }
+    if layer.order == egui::Order::Background {
+        let id = if app.ui.window == crate::MainWindow::Mix { "window.mix" } else { "window.edit" };
+        return Some(Page::Command(id.into()));
+    }
+    None
+}
+
+/// Cmd+?: open help, on the page for the window under the pointer when there is one.
+pub fn open_here(app: &mut SoundApp, ctx: &egui::Context) {
+    let page = page_under_pointer(app, ctx);
+    let _ = app.run("help.open", serde_json::json!({}));
+    if let Some(p) = page.filter(|p| entry_for(p).is_some()) {
+        app.ui.help.go(p);
+    }
+}
+
 /// Why an engine command can't run now, as the command itself explains it.
 fn why_disabled(app: &SoundApp, id: &str) -> Option<String> {
     let c = soundcraft_engine::find_command(id)?;
@@ -803,6 +1180,21 @@ mod tests {
         assert!(search("ctrl+s").iter().any(|e| e.page == Page::Command("session.save".into())), "the PC spelling finds it too");
         assert!(search("ctrl+shift+i").iter().any(|e| e.page == Page::Command("file.import_audio".into())));
         assert!(search("zzqqxx").is_empty());
+        // The command on exactly that key comes first, before Cmd+Shift+S and friends.
+        assert_eq!(first(&save), Some(Page::Command("session.save".into())));
+        assert_eq!(first("ctrl+s"), Some(Page::Command("session.save".into())));
+        assert_eq!(first("Ctrl + S"), Some(Page::Command("session.save".into())));
+        // One slipped letter still finds the page; short words don't match loosely.
+        assert!(search("sholo").iter().any(|e| e.title == "Solo"), "{:?}", search("sholo").iter().map(|e| &e.title).collect::<Vec<_>>());
+        assert!(search("bounse").iter().any(|e| e.page == Page::Command("file.bounce_mix".into())));
+        assert!(
+            one_typo("solo", "sloo")
+                && one_typo("solo", "soloo")
+                && !one_typo("solo", "slo")
+                && one_typo("loop", "lopo")
+                && !one_typo("mix", "max")
+                && !one_typo("solo", "sold out")
+        );
         assert!(search("   ").is_empty());
     }
 
@@ -879,6 +1271,99 @@ mod tests {
             for c in &chars {
                 assert!(ctx.fonts_mut(|f| f.has_glyphs(&font, &c.to_string())), "{family:?} has no glyph for {c:?}");
             }
+        }
+    }
+
+    #[test]
+    fn every_guide_names_real_menus_keys_and_commands() {
+        let d = parse().unwrap();
+        assert!(d.guides.len() >= 10, "{} guides", d.guides.len());
+        let mut ids = HashSet::new();
+        for g in &d.guides {
+            assert!(ids.insert(g.id.as_str()), "{}: id used twice", g.id);
+            assert!(category(&g.category).is_some(), "{}: unknown category {}", g.id, g.category);
+            assert!(!g.title.trim().is_empty() && !g.summary.trim().is_empty(), "{}: needs a title and summary", g.id);
+            assert!(!g.steps.is_empty() || !g.keys.is_empty(), "{}: empty", g.id);
+            for c in &g.related {
+                assert!(d.commands.contains_key(c), "{}: related `{c}` has no page", g.id);
+            }
+            for line in g.steps.iter().chain(g.keys.iter().flat_map(|(k, what)| [k, what])) {
+                assert_eq!(line.matches('{').count(), line.matches('}').count(), "{}: unbalanced braces in {line}", g.id);
+                for mac in [true, false] {
+                    for (text, named) in spans(line, mac) {
+                        assert!(!text.contains('{') && !text.contains('}'), "{}: {line}", g.id);
+                        if named {
+                            assert!(!text.contains(':') || text.contains('›'), "{}: `{text}` names nothing in {line}", g.id);
+                        }
+                    }
+                }
+                let mut rest = line.as_str();
+                while let Some(open) = rest.find('{') {
+                    let close = rest[open..].find('}').unwrap() + open;
+                    let token = &rest[open + 1..close];
+                    for mac in [true, false] {
+                        assert!(token_text(token, mac).is_some(), "{}: `{{{token}}}` names nothing", g.id);
+                    }
+                    rest = &rest[close + 1..];
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn guides_show_the_keys_of_each_platform() {
+        let line = "Save with {menu:session.save} ({key:session.save}), record with {keys:Cmd+Space}.";
+        let text = |mac| spans(line, mac).into_iter().map(|(t, _)| t).collect::<String>();
+        assert_eq!(text(true), "Save with File › Save Session (Cmd+S), record with Cmd+Space.");
+        assert_eq!(text(false), "Save with File › Save Session (Ctrl+S), record with Ctrl+Space.");
+        assert_eq!(spans(line, true).iter().filter(|(_, named)| *named).count(), 3);
+        // A Mac Control chord says so off the Mac; a Ctrl chord that works everywhere doesn't.
+        assert_eq!(key_text("Cmd+Ctrl+S", false), "Cmd+Ctrl+S (Mac only)");
+        assert_eq!(key_text("Ctrl+Up", false), "Ctrl+Up");
+        assert_eq!(keys_cell("Ctrl+Up / Ctrl+Down", false), "Ctrl+Up / Ctrl+Down");
+        assert_eq!(keys_cell("Z / Shift+Z", false), "Z / Shift+Z");
+        assert_eq!(keys_cell("Cmd+Space", false), "Ctrl+Space");
+        assert_eq!(keys_cell("Alt+Tab | Ctrl+Tab", true), "Alt+Tab");
+        assert_eq!(keys_cell("Alt+Tab | Ctrl+Tab", false), "Ctrl+Tab");
+    }
+
+    #[test]
+    fn guides_read_right_off_the_mac() {
+        // Cmd becomes Ctrl off the Mac, so a guide must not also name Ctrl beside it, and a PC
+        // must never be told to press Alt+Tab, which the desktop takes.
+        for g in &data().guides {
+            for mac in [true, false] {
+                for line in g.steps.iter().chain(g.keys.iter().map(|(_, what)| what)) {
+                    let text: String = spans(line, mac).into_iter().map(|(t, _)| t).collect();
+                    for twice in ["Ctrl, Ctrl", "Ctrl or Ctrl", "Ctrl and Ctrl", "Cmd, Cmd"] {
+                        assert!(!text.contains(twice), "{} ({}): {text}", g.id, if mac { "Mac" } else { "PC" });
+                    }
+                }
+                for (keys, _) in &g.keys {
+                    assert!(mac || !keys_cell(keys, mac).contains("Alt+Tab"), "{}: {keys}", g.id);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn guides_are_found_by_search_and_listed_first_in_their_topic() {
+        assert_eq!(search("record audio").first().map(|e| &e.page), Some(&Page::Guide("record_audio".into())));
+        assert!(search("ctrl+shift+n").iter().any(|e| e.page == Page::Guide("first_session".into())), "PC keys are searchable");
+        assert!(search("cmd+shift+n").iter().any(|e| e.page == Page::Guide("first_session".into())), "Mac keys are searchable");
+        let first = pages_in("recording").next().map(|e| e.page.clone());
+        assert_eq!(first, Some(Page::Guide("record_audio".into())));
+        assert!(pages().contains(&Page::Guide("keys_commands_focus".into())));
+        assert_eq!(category_of(&Page::Guide("keys_transport".into())), Some("transport"));
+    }
+
+    #[test]
+    fn every_window_help_knows_has_a_page() {
+        let d = parse().unwrap();
+        let mut titles = HashSet::new();
+        for (title, id) in WINDOW_PAGES {
+            assert!(titles.insert(title), "{title} listed twice");
+            assert!(d.commands.contains_key(id), "{title}: {id} has no page");
         }
     }
 
